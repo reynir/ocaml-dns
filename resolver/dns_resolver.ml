@@ -2,6 +2,8 @@
 
 open Dns
 
+let ( let* ) = Result.bind
+
 type key = [ `raw ] Domain_name.t * Packet.Question.qtype
 
 let pp_key = Dns_resolver_cache.pp_question
@@ -260,18 +262,19 @@ let resolve t ts proto sender sport req =
     let buf, _ = Packet.encode proto pkt in
     t, [ proto, sender, sport, buf ], []
 
-let handle_reply t ts proto sender packet reply =
+let handle_reply t now ts proto sender packet reply =
   match reply, Packet.Question.qtype packet.Packet.question with
   | `Answer _, Some qtype
   | `Rcode_error (Rcode.NXDomain, Opcode.Query, _), Some qtype
   | `Rcode_error (Rcode.ServFail, Opcode.Query, _), Some qtype ->
-    Logs.info (fun m -> m "handling reply %a" Packet.pp packet);
-    (* (a) first check whether frame was in transit! *)
-    let key = fst packet.question, qtype in
-    let r, transit = was_in_transit t.transit key (fst packet.header) sender in
-    let t = { t with transit } in
-    let r = match r with
-      | None -> (t, [], [])
+    begin
+      Logs.info (fun m -> m "handling reply %a" Packet.pp packet);
+      (* (a) first check whether frame was in transit! *)
+      let key = fst packet.question, qtype in
+      let r, transit = was_in_transit t.transit key (fst packet.header) sender in
+      let t = { t with transit } in
+      match r with
+      | None -> Ok (t, [], [])
       | Some (zone, edns) ->
         (* (b) DNSSec verification of RRs *)
         let t, dnskeys =
@@ -326,17 +329,23 @@ let handle_reply t ts proto sender packet reply =
               Logs.warn (fun m -> m "no DNSKEYS in cache for %a" Domain_name.pp zone);
               None
         in
-        (* TODO verify packet with the dnskeys above, only take in answer & authority signed stuff *)
-        (* at least as long as dnskeys are available *)
-        (* if dnskeys is None, *)
-        let packet = Dnssec.verify dnskeys packet in
+        let* packet =
+          Option.fold
+            ~none:(Ok packet)
+            ~some:(fun dnskeys ->
+                Result.map_error (fun (`Msg msg) ->
+                    Logs.err (fun m -> m "error %s verifying reply %a"
+                                 msg Packet.pp_reply reply))
+                  (Dnssec.verify_packet now dnskeys packet))
+            dnskeys
+        in
         (* (c) now we scrub and either *)
         match scrub_it t.cache proto zone edns ts qtype packet with
         | `Query_without_edns ->
           let t, cs = build_query t ts proto key 1 zone None sender in
           Logs.debug (fun m -> m "resolve: requery without edns %a %a"
                          Ipaddr.pp sender pp_key key) ;
-          (t, [], [ `Udp, sender, cs ])
+          Ok (t, [], [ `Udp, sender, cs ])
         | `Upgrade_to_tcp cache ->
           (* RFC 2181 Sec 9: correct would be to drop entire frame, and retry with tcp *)
           (* but we're happy to retrieve the partial information, it may be useful *)
@@ -354,15 +363,14 @@ let handle_reply t ts proto sender packet reply =
           let t, cs = build_query ~recursion_desired t ts `Tcp key 1 zone None sender in
           Logs.debug (fun m -> m "resolve: upgrade to tcp %a %a"
                          Ipaddr.pp sender pp_key key) ;
-          (t, out_a, (`Tcp, sender, cs) :: out_q)
+        Ok (t, out_a, (`Tcp, sender, cs) :: out_q)
         | `Try_another_ns ->
           (* is this the right behaviour? by luck we'll use another path *)
-          handle_awaiting_queries t ts key
+          Ok (handle_awaiting_queries t ts key)
         | `Cache cache ->
           let t = { t with cache } in
-          handle_awaiting_queries t ts key
-    in
-    Ok r
+          Ok (handle_awaiting_queries t ts key)
+    end
   | v, _ ->
     Logs.err (fun m -> m "ignoring reply %a" Packet.pp_reply v);
     Error ()
@@ -452,7 +460,7 @@ let handle_buf t now ts query proto sender sport buf =
     match res.Packet.data with
     | #Packet.reply as reply ->
       begin
-        match handle_reply t ts proto sender res reply with
+        match handle_reply t now ts proto sender res reply with
         | Ok a -> a
         | Error () -> t, [], []
       end
