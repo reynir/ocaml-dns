@@ -74,6 +74,15 @@ let resolve t ~rng ip_proto ts name typ =
     | `Ipv4_only -> [`K (Rr_map.K A)]
     | `Ipv6_only -> [`K (Rr_map.K Aaaa)]
   in
+  (* with DNSSec:
+     - input is qname and qtyp
+     - (a) we have (validated) NS record (+DNSKEY) for zone -> move along
+     - (b) we miss a NS entry -> drop label and find one
+     ---> we also want to collect DS and DNSKEY entries (or non-existence of DS)
+     ---> we get DS by dnssec ok in EDNS
+     ---> we may have unsigned NS (+ glue), and need to ask the NS for NS (+dnssec)
+     ---> we may have unsigned glue, and need to go down for signed A/AAAA
+  *)
   let rec go t types name =
     Logs.debug (fun m -> m "go %a" Domain_name.pp name) ;
     match find_nearest_ns rng ip_proto ts t (Domain_name.raw name) with

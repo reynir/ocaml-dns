@@ -97,7 +97,8 @@ let maybe_query ?recursion_desired t ts await retry ip name typ =
     None, t
   else
     (* TODO here we may want to use the _default protocol_ (and edns settings) instead of `Udp *)
-    let t, packet = build_query ?recursion_desired t ts `Udp k retry await.zone (Some (Edns.create ())) ip in
+    let edns = Some (Edns.create ~dnssec_ok:true ()) in
+    let t, packet = build_query ?recursion_desired t ts `Udp k retry await.zone edns ip in
     let t = { t with queried = QM.add k [await] t.queried } in
     Logs.debug (fun m -> m "maybe_query: query %a %a" Ipaddr.pp ip pp_key k) ;
     Some (packet, ip), t
@@ -260,20 +261,76 @@ let resolve t ts proto sender sport req =
     t, [ proto, sender, sport, buf ], []
 
 let handle_reply t ts proto sender packet reply =
-  let id = fst packet.Packet.header in
-  match reply, Packet.Question.qtype packet.question with
+  match reply, Packet.Question.qtype packet.Packet.question with
   | `Answer _, Some qtype
   | `Rcode_error (Rcode.NXDomain, Opcode.Query, _), Some qtype
   | `Rcode_error (Rcode.ServFail, Opcode.Query, _), Some qtype ->
     Logs.info (fun m -> m "handling reply %a" Packet.pp packet);
     (* (a) first check whether frame was in transit! *)
     let key = fst packet.question, qtype in
-    let r, transit = was_in_transit t.transit key id sender in
+    let r, transit = was_in_transit t.transit key (fst packet.header) sender in
     let t = { t with transit } in
     let r = match r with
       | None -> (t, [], [])
       | Some (zone, edns) ->
-        (* (b) now we scrub and either *)
+        (* (b) DNSSec verification of RRs *)
+        let t, dnskeys =
+          (* TODO the tricky part is that DS or DNSKEYS may already have ttl
+             exceeded and need to be looked up again (before we're able to
+             process this reply) *)
+          match qtype with
+          | `K K Rr_map.Dnskey ->
+            let cache, ds = Dns_cache.get t.cache ts zone Rr_map.Ds in
+            { t with cache },
+            begin match ds with
+              | Ok `Entry (_, ds_set) ->
+                let keys = match packet.data with
+                  | `Answer (a, _) -> Name_rr_map.find zone Rr_map.Dnskey a
+                  | _ -> None
+                in
+                let ds_set =
+                  (* RFC 4509 - drop SHA1 DS if SHA2 DS are present *)
+                  if Rr_map.Ds_set.exists (fun ds ->
+                      match ds.Ds.digest_type with
+                      | Ds.SHA256 | Ds.SHA384 -> true | _ -> false)
+                      ds_set
+                  then
+                    Rr_map.Ds_set.filter
+                      (fun ds -> not (ds.Ds.digest_type = SHA1))
+                      ds_set
+                  else
+                    ds_set
+                in
+                Option.map (fun (_, dnskeys) ->
+                    Rr_map.Ds_set.fold (fun ds acc ->
+                        match Dnssec.validate_ds zone dnskeys ds with
+                        | Ok key -> Rr_map.Dnskey_set.add key acc
+                        | Error `Msg msg ->
+                          Logs.warn (fun m -> m "couldn't validate DS (for %a): %s"
+                                        Domain_name.pp zone msg);
+                          acc)
+                      ds_set Rr_map.Dnskey_set.empty)
+                  keys
+              | _ ->
+                (* TODO re-request? in case of nodata, we can continue *)
+                Logs.warn (fun m -> m "no DS in cache for %a" Domain_name.pp zone);
+                None
+            end
+          | _ ->
+            let cache, dnskeys = Dns_cache.get t.cache ts zone Rr_map.Dnskey in
+            { t with cache },
+            match dnskeys with
+            | Ok `Entry (_, dnskey_set) -> Some dnskey_set
+            | _ ->
+              (* TODO distinguish nodata from not in cache *)
+              Logs.warn (fun m -> m "no DNSKEYS in cache for %a" Domain_name.pp zone);
+              None
+        in
+        (* TODO verify packet with the dnskeys above, only take in answer & authority signed stuff *)
+        (* at least as long as dnskeys are available *)
+        (* if dnskeys is None, *)
+        let packet = Dnssec.verify dnskeys packet in
+        (* (c) now we scrub and either *)
         match scrub_it t.cache proto zone edns ts qtype packet with
         | `Query_without_edns ->
           let t, cs = build_query t ts proto key 1 zone None sender in
@@ -401,11 +458,12 @@ let handle_buf t now ts query proto sender sport buf =
       end
     | #Packet.request as req when query ->
       begin
-        (* TODO there used to be a `No case here, and `None returned t, [], [] *)
         match handle_primary t.primary now ts proto sender sport res req buf with
         | `Reply (primary, pkt) -> { t with primary }, [ proto, sender, sport, pkt ], []
         | `Delegation dele -> handle_delegation t ts proto sender sport res dele
-        | `None -> resolve t ts proto sender sport res
+        | `None ->
+          (* DNSSEC request DS / DNSKEY / NS from auth *)
+          resolve t ts proto sender sport res
       end
     | _ ->
       Logs.err (fun m -> m "ignoring unsolicited packet (query allowed? %b) %a" query Packet.pp res);

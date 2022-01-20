@@ -243,7 +243,6 @@ let nxdomain (_, flags) name data =
   (* the cname does not matter *)
   List.map (fun (name, res) -> name, res, rank) entries
 
-(* stub vs recursive: maybe sufficient to look into *)
 let scrub zone qtype p =
   Logs.debug (fun m -> m "scrubbing (bailiwick %a) data %a"
                  Domain_name.pp zone Packet.pp p);
