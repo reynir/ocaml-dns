@@ -1,10 +1,10 @@
 let jump () salt iterations domain =
   Logs.debug (fun m -> m "Hashing with salt %a using %d iterations on domain %a"
-                 (Fmt.of_to_string Base32.encode) salt
+                 Cstruct.hexdump_pp salt
                  iterations
                  Domain_name.pp domain);
   let domain = Domain_name.canonical domain in
-  let hash = Dnssec.nsec3_hash (Cstruct.of_string salt) iterations domain in
+  let hash = Dnssec.nsec3_hash salt iterations domain in
   print_endline (Base32.encode (Cstruct.to_string hash))
 
 open Cmdliner
@@ -13,17 +13,16 @@ let to_presult = function
   | Ok a -> `Ok a
   | Error s -> `Error s
 
-let parse_base32 : string Arg.conv =
+let parse_hex : Cstruct.t Arg.conv =
   (fun s ->
-     match Base32.decode ~unpadded:true s with
-     | Ok s -> `Ok s
-     | Error `Msg e -> `Error e),
-  Fmt.(of_to_string (fun s -> Base32.encode s))
+     try `Ok (Cstruct.of_hex s)
+     with Invalid_argument s -> `Error s),
+  Cstruct.hexdump_pp
 
 
 let arg_salt =
   let doc = "Salt to use for NSEC3 hash" in
-  Arg.(required & pos 0 (some parse_base32) None & info [] ~docv:"SALT" ~doc)
+  Arg.(required & pos 0 (some parse_hex) None & info [] ~docv:"SALT" ~doc)
 
 let arg_iterations =
   let doc = "Number of hashing iterations" in

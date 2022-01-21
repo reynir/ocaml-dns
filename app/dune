@@ -52,4 +52,4 @@
 (executable
   (name onsec3hash)
   (modules onsec3hash)
-  (libraries dns-cli cmdliner dnssec))
+  (libraries dns-cli cmdliner hex dnssec))
