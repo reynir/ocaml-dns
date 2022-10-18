@@ -41,3 +41,6 @@ module type S = sig
 end
 
 module Make (R : Mirage_random.S) (T : Mirage_time.S) (M : Mirage_clock.MCLOCK) (P : Mirage_clock.PCLOCK) (S : Tcpip.Stack.V4V6) : S with type Transport.stack = S.t
+
+val format : string
+(** A string describing the desired format of [S.nameserver_of_string] *)

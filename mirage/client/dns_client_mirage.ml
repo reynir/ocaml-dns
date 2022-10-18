@@ -26,15 +26,11 @@ module type S = sig
     Transport.stack -> t Lwt.t
 end
 
-module Make (R : Mirage_random.S) (T : Mirage_time.S) (M : Mirage_clock.MCLOCK) (P : Mirage_clock.PCLOCK) (S : Tcpip.Stack.V4V6) = struct
-  module TLS = Tls_mirage.Make(S.TCP)
-  module CA = Ca_certs_nss.Make(P)
+let auth_err = match X509.Authenticator.of_string "" with
+  | Ok _ -> "should not happen"
+  | Error `Msg m -> m
 
-  let auth_err = match X509.Authenticator.of_string "" with
-    | Ok _ -> "should not happen"
-    | Error `Msg m -> m
-
-  let format = {|
+let format = {|
 The format of an IP address and optional port is:
 - '[::1]:port' for an IPv6 address, or
 - '127.0.0.1:port' for an IPv4 address.
@@ -62,6 +58,10 @@ The format of a nameserver is:
   authenticator: a TCP connection will be established, on top of which a TLS
   handshake with the authenticator will be done.
 |} ^ auth_err
+
+module Make (R : Mirage_random.S) (T : Mirage_time.S) (M : Mirage_clock.MCLOCK) (P : Mirage_clock.PCLOCK) (S : Tcpip.Stack.V4V6) = struct
+  module TLS = Tls_mirage.Make(S.TCP)
+  module CA = Ca_certs_nss.Make(P)
 
   let nameserver_of_string str =
     let ( let* ) = Result.bind in
